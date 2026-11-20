@@ -1,12 +1,10 @@
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
-use serde_json::json;
-use specman::{ArtifactKind, ArtifactSummary, DependencyEdge, DependencyTree, TemplateLocator};
+use specman::{ArtifactKind, ArtifactSummary, DependencyEdge};
 
-use crate::commands::CommandResult;
-use crate::commands::dependencies::{self, DependencyScope, DependencyView};
-use crate::commands::templates::PointerAction;
+use crate::commands::install::InstallReport;
+use crate::commands::{CommandResult, DependencyScope, DependencyView};
 use crate::error::CliError;
 
 pub enum OutputFormat {
@@ -14,9 +12,8 @@ pub enum OutputFormat {
     Json,
 }
 
-/// Renders a `CommandResult` as either human-readable text or newline-delimited JSON,
-/// satisfying the Observability & Error Surfacing concept while converting outcomes into
-/// deterministic exit codes.
+/// Renders a `CommandResult` as human-readable text or JSON, converting outcomes into
+/// deterministic `sysexits` exit codes.
 pub fn emit_result(result: CommandResult, format: OutputFormat) -> Result<ExitCode, CliError> {
     match format {
         OutputFormat::Text => print_text(&result),
@@ -35,54 +32,68 @@ fn print_text(result: &CommandResult) {
                     specman::StatusResult::Fail => "FAIL",
                 }
             );
+            println!(
+                "Spec/Impl Status: {}",
+                match report.spec_impl_status {
+                    specman::StatusResult::Pass => "PASS",
+                    specman::StatusResult::Fail => "FAIL",
+                }
+            );
+            println!("Artifact Count: {}", report.artifact_count);
 
             if !report.structure_errors.is_empty() {
                 println!("\nStructure Errors:");
                 for error in &report.structure_errors {
-                    println!("  - {}", error);
+                    println!("  - {error}");
                 }
             }
-
             if !report.cycle_errors.is_empty() {
                 println!("\nCycle Errors:");
                 for error in &report.cycle_errors {
-                    println!("  - {}", error);
+                    println!("  - {error}");
                 }
             }
-
-            println!("\nArtifacts:");
-            for (id, status) in &report.artifacts {
-                let status_label = if status.is_pass() { "OK" } else { "FAIL" };
-                println!("  [{}] {} ({:?})", status_label, id.name, id.kind);
-
-                for err in &status.structure_errors {
-                    println!("    [Structure] {}", err);
-                }
-                for issue in &status.reference_errors {
-                    let loc = issue
-                        .source
-                        .range
-                        .as_ref()
-                        .map(|r| format!(":{}:{}", r.start.line, r.start.column))
-                        .unwrap_or_default();
+            if !report.artifacts.is_empty() {
+                println!("\nArtifacts:");
+                for (id, status) in &report.artifacts {
+                    let label = if status.reference_errors.is_empty()
+                        && status.compliance_missing.is_empty()
+                    {
+                        "OK"
+                    } else {
+                        "FAIL"
+                    };
                     println!(
-                        "    [{:?}] {}{}",
-                        issue.severity, issue.message, loc
+                        "  [{label}] {name} ({kind:?})",
+                        name = id.name,
+                        kind = id.kind
                     );
-                }
-                for missing in &status.compliance_missing {
-                    println!("    [Compliance] Missing: {}", missing);
-                }
-                if let Some(scan_root) = &status.compliance_scan_root {
-                    println!("    [Compliance] Scan root: {}", scan_root);
-                }
-                for orphan in &status.compliance_orphans {
-                     println!(
-                        "    [Compliance] Orphan tag: {} at {}:{}",
-                        orphan.identifier,
-                        orphan.location.file_path.display(),
-                        orphan.location.line_number
-                    );
+                    for err in &status.structure_errors {
+                        println!("    [Structure] {err}");
+                    }
+                    for issue in &status.reference_errors {
+                        let loc = match (issue.line, issue.column) {
+                            (Some(line), Some(col)) => format!(":{line}:{col}"),
+                            (Some(line), None) => format!(":{line}"),
+                            _ => String::new(),
+                        };
+                        println!(
+                            "    [{issue:?}] {msg}{loc}",
+                            issue = issue.issue_type,
+                            msg = issue.destination
+                        );
+                    }
+                    for missing in &status.compliance_missing {
+                        println!("    [Compliance] Missing: {missing}");
+                    }
+                    for orphan in &status.compliance_orphans {
+                        println!(
+                            "    [Compliance] Orphan tag: {id} at {file}:{line}",
+                            id = orphan.identifier,
+                            file = orphan.location.file_path,
+                            line = orphan.location.line_number
+                        );
+                    }
                 }
             }
         }
@@ -95,260 +106,222 @@ fn print_text(result: &CommandResult) {
             if *dry_run {
                 if *created {
                     println!(
-                        "Dry run: would initialize workspace at {} (.specman at {})",
-                        root, dot_specman
+                        "Dry run: would initialize workspace at {root} (.specman at {dot_specman})"
                     );
                 } else {
                     println!(
-                        "Dry run: workspace already initialized at {} (.specman at {})",
-                        root, dot_specman
+                        "Dry run: workspace already initialized at {root} (.specman at {dot_specman})"
                     );
                 }
             } else if *created {
-                println!(
-                    "Initialized workspace at {} (.specman: {})",
-                    root, dot_specman
-                );
+                println!("Initialized workspace at {root} (.specman: {dot_specman})");
             } else {
-                println!(
-                    "Workspace already initialized at {} (.specman: {})",
-                    root, dot_specman
-                );
+                println!("Workspace already initialized at {root} (.specman: {dot_specman})");
             }
         }
-        CommandResult::SpecList { specs } => {
-            println!("Specifications ({}):", specs.len());
-            for spec in specs {
-                let version = spec.version.as_deref().unwrap_or("unknown");
-                println!("  - {} (version: {version})", spec.name);
-            }
-        }
-        CommandResult::SpecCreated { summary, path } => {
-            println!("Created specification '{}' at {}", summary.name, path);
-        }
+        CommandResult::SpecCreated { name, index, path } => match index {
+            Some(index) => println!("Created specification '{name}' (index: {index}) at {path}"),
+            None => println!("Created specification '{name}' at {path}"),
+        },
         CommandResult::SpecDeleted {
-            summary,
+            name,
             forced,
-            tree,
             removed_path,
         } => {
             if *forced {
-                println!(
-                    "Deleted specification '{}' with --force (removed: {})",
-                    summary.name, removed_path
-                );
+                println!("Deleted specification '{name}' with --force (removed: {removed_path})");
             } else {
-                println!(
-                    "Deleted specification '{}' (removed: {})",
-                    summary.name, removed_path
-                );
-            }
-            print_dependency_tree(tree);
-        }
-        CommandResult::ImplList { implementations } => {
-            println!("Implementations ({}):", implementations.len());
-            for imp in implementations {
-                let version = imp.version.as_deref().unwrap_or("unknown");
-                let target_spec = imp
-                    .spec_identifier
-                    .as_deref()
-                    .or(imp.spec_locator.as_deref())
-                    .unwrap_or("unknown");
-                println!(
-                    "  - {} (target: {}, version: {version})",
-                    imp.name, target_spec
-                );
+                println!("Deleted specification '{name}' (removed: {removed_path})");
             }
         }
-        CommandResult::ImplCreated { summary, path } => {
-            println!("Created implementation '{}' at {}", summary.name, path);
+        CommandResult::ImplCreated { name, path } => {
+            println!("Created implementation '{name}' at {path}");
         }
         CommandResult::ImplDeleted {
-            summary,
+            name,
             forced,
-            tree,
             removed_path,
         } => {
             if *forced {
-                println!(
-                    "Deleted implementation '{}' with --force (removed: {})",
-                    summary.name, removed_path
-                );
+                println!("Deleted implementation '{name}' with --force (removed: {removed_path})");
             } else {
-                println!(
-                    "Deleted implementation '{}' (removed: {})",
-                    summary.name, removed_path
-                );
+                println!("Deleted implementation '{name}' (removed: {removed_path})");
             }
-            print_dependency_tree(tree);
         }
-        CommandResult::ScratchList {
-            pads,
-            missing_metadata,
+        CommandResult::Install { report } => print_install(report),
+        CommandResult::ManifestUpdated { manifest } => {
+            println!("Updated specman.json manifest for '{}'", manifest.name());
+        }
+        CommandResult::Compliance(report) => {
+            println!(
+                "Compliance report for '{}' (spec: '{}')",
+                report.implementation.name, report.specification.name
+            );
+            println!("Coverage:");
+            if report.coverage.is_empty() {
+                println!("  (none)");
+            }
+            for (group, tags) in &report.coverage {
+                println!("  - {group}: {} tag(s)", tags.len());
+                for tag in tags {
+                    println!(
+                        "      {file}:{line} ({tag_type:?})",
+                        file = tag.location.file_path,
+                        line = tag.location.line_number,
+                        tag_type = tag.tag_type
+                    );
+                }
+            }
+            if !report.missing.is_empty() {
+                println!("Missing coverage:");
+                for group in &report.missing {
+                    println!("  - {group}");
+                }
+            }
+            if !report.orphans.is_empty() {
+                println!("Orphaned tags:");
+                for tag in &report.orphans {
+                    println!(
+                        "  - {id} at {file}:{line}",
+                        id = tag.identifier,
+                        file = tag.location.file_path,
+                        line = tag.location.line_number
+                    );
+                }
+            }
+        }
+        CommandResult::StructureList {
+            headings,
+            constraints,
         } => {
-            if *missing_metadata {
-                println!("Scratch pads ({}): metadata issues detected", pads.len());
-            } else {
-                println!("Scratch pads ({}):", pads.len());
+            println!("Headings ({}):", headings.len());
+            for slug in headings {
+                println!("  - {slug}");
             }
-            for pad in pads {
-                println!(
-                    "  - {} (target: {}, work_type: {})",
-                    pad.name,
-                    pad.target.as_deref().unwrap_or("unknown"),
-                    pad.work_type.as_deref().unwrap_or("unknown")
-                );
-                let mut issues = Vec::new();
-                if pad.target.is_none() {
-                    issues.push("missing target");
-                }
-                if pad.work_type.is_none() {
-                    issues.push("missing work_type");
-                }
-                if !issues.is_empty() {
-                    println!("    ! {}", issues.join(", "));
-                }
+            println!("Constraint groups ({}):", constraints.len());
+            for group in constraints {
+                println!("  - {group}");
             }
         }
-        CommandResult::ScratchCreated { summary, path } => {
-            println!("Created scratch pad '{}' at {}", summary.name, path);
-        }
-        CommandResult::ScratchDeleted {
-            summary,
-            forced,
-            tree,
-            removed_path,
-        } => {
-            if *forced {
-                println!(
-                    "Deleted scratch pad '{}' with --force (removed: {})",
-                    summary.name, removed_path
-                );
-            } else {
-                println!(
-                    "Deleted scratch pad '{}' (removed: {})",
-                    summary.name, removed_path
-                );
-            }
-            print_dependency_tree(tree);
+        CommandResult::StructureShow { content } => {
+            println!("{content}");
         }
         CommandResult::DependencyTree { scope, view, tree } => {
             print_dependency_view(*scope, *view, tree);
         }
-        CommandResult::TemplatePointer { report } => {
-            let action_label = match report.action {
-                PointerAction::Set => "Updated",
-                PointerAction::Remove => "Removed",
-            };
-            println!(
-                "{} pointer for {} (tier: {:?})",
-                action_label, report.kind, report.provenance.tier
-            );
-            println!(
-                "  Locator: {}",
-                describe_template_locator(&report.descriptor.locator)
-            );
-            println!("  Provenance locator: {}", report.provenance.locator);
-            if let Some(pointer) = &report.provenance.pointer {
-                println!("  Pointer file: {pointer}");
-            }
-            if let Some(cache_path) = &report.provenance.cache_path {
-                println!("  Cache: {cache_path}");
-            }
-            if let Some(last_modified) = &report.provenance.last_modified {
-                println!("  Last-Modified: {last_modified}");
-            }
-        }
+    }
+}
+
+fn print_install(report: &InstallReport) {
+    println!("Installed {} reference(s)", report.requested);
+    for materialized in &report.materialized {
+        println!("  - {materialized}");
     }
 }
 
 fn print_json(result: &CommandResult) -> Result<(), CliError> {
-    let payload = json!(result);
+    let payload = match result {
+        // `WorkspaceStatusReport.artifacts` is keyed by `ArtifactId`, which is not a JSON string,
+        // so we serialize it manually with stringified keys.
+        CommandResult::Status(report) => status_report_to_json(report)?,
+        other => serde_json::to_value(other).map_err(|e| {
+            CliError::new(
+                format!("failed to serialize output: {e}"),
+                crate::error::ExitStatus::Software,
+            )
+        })?,
+    };
     println!("{payload}");
     Ok(())
 }
 
-fn print_dependency_tree(tree: &DependencyTree) {
-    render_direction_section(
-        "Downstream",
-        tree,
-        DependencyView::Downstream,
-        /*indent_root=*/ true,
-    );
+/// Serializes a [`specman::WorkspaceStatusReport`] to JSON, stringifying the `ArtifactId` keys of
+/// the `artifacts` map (serialized as `"kind://name"`).
+fn status_report_to_json(
+    report: &specman::WorkspaceStatusReport,
+) -> Result<serde_json::Value, CliError> {
+    let mut artifacts = serde_json::Map::new();
+    for (id, status) in &report.artifacts {
+        let status_value = serde_json::to_value(status).map_err(|e| {
+            CliError::new(
+                format!("failed to serialize artifact status: {e}"),
+                crate::error::ExitStatus::Software,
+            )
+        })?;
+        artifacts.insert(id.to_string(), status_value);
+    }
+
+    let global_status = match report.global_status {
+        specman::StatusResult::Pass => "Pass",
+        specman::StatusResult::Fail => "Fail",
+    };
+    let spec_impl_status = match report.spec_impl_status {
+        specman::StatusResult::Pass => "Pass",
+        specman::StatusResult::Fail => "Fail",
+    };
+
+    Ok(serde_json::json!({
+        "type": "status",
+        "global_status": global_status,
+        "spec_impl_status": spec_impl_status,
+        "artifacts": artifacts,
+        "cycle_errors": report.cycle_errors,
+        "structure_errors": report.structure_errors,
+        "artifact_count": report.artifact_count,
+    }))
 }
 
-fn print_dependency_view(scope: DependencyScope, view: DependencyView, tree: &DependencyTree) {
+fn print_dependency_view(
+    scope: DependencyScope,
+    view: DependencyView,
+    tree: &specman::DependencyTree,
+) {
     println!(
         "Dependency tree ({}) for {} '{}'",
-        dependencies::view_label(view),
-        dependencies::scope_label(scope),
+        view_label(view),
+        scope_label(scope),
         tree.root.id.name
     );
 
     match view {
         DependencyView::All => {
-            render_direction_section("Downstream", tree, DependencyView::Downstream, false);
-            render_direction_section("Upstream", tree, DependencyView::Upstream, false);
+            render_direction_section("Downstream", &tree.downstream, tree);
+            render_direction_section("Upstream", &tree.upstream, tree);
         }
-        other => {
-            let title = capitalize(dependencies::view_label(other));
-            render_direction_section(&title, tree, other, false);
+        DependencyView::Downstream => {
+            render_direction_section("Downstream", &tree.downstream, tree)
         }
+        DependencyView::Upstream => render_direction_section("Upstream", &tree.upstream, tree),
     }
 }
 
-fn render_direction_section(
-    title: &str,
-    tree: &DependencyTree,
-    view: DependencyView,
-    indent_root: bool,
-) {
-    let edges = match view {
-        DependencyView::Downstream => &tree.downstream,
-        DependencyView::Upstream => &tree.upstream,
-        DependencyView::All => &tree.aggregate,
-    };
-
-    if view == DependencyView::All {
-        // The caller renders both sections separately when `--all` is selected, so this
-        // branch should never be hit in practice.
-        return;
-    }
-
-    println!("  {}: {} edge(s)", title, edges.len());
-    let prefix = if indent_root { "    " } else { "  " };
-    println!("{}{}", prefix, artifact_label(&tree.root));
+fn render_direction_section(title: &str, edges: &[DependencyEdge], tree: &specman::DependencyTree) {
+    println!("  {title} ({} edge(s)):", edges.len());
+    println!("    {}", artifact_label(&tree.root));
     if edges.is_empty() {
-        println!("{prefix}  (none)");
+        println!("      (none)");
         return;
     }
 
-    let children = build_children_map(edges, view);
+    let children_map = build_children_map(edges);
     let mut stack = Vec::new();
-    render_children(&tree.root, &children, prefix.to_string(), &mut stack);
+    render_children(&tree.root, &children_map, "      ".to_string(), &mut stack);
 }
 
-fn build_children_map(
-    edges: &[DependencyEdge],
-    view: DependencyView,
-) -> BTreeMap<String, Vec<ArtifactSummary>> {
+// Edges are directional: `from` is the artifact that depends on `to`. We build a parent ->
+// children map keyed by the `from` name so the root artifact's dependencies render as a tree.
+fn build_children_map(edges: &[DependencyEdge]) -> BTreeMap<String, Vec<ArtifactSummary>> {
     let mut map: BTreeMap<String, Vec<ArtifactSummary>> = BTreeMap::new();
 
     for edge in edges {
-        let (parent, child) = match view {
-            DependencyView::Downstream => (&edge.to, &edge.from),
-            DependencyView::Upstream => (&edge.from, &edge.to),
-            DependencyView::All => unreachable!("all view handled earlier"),
-        };
-        map.entry(parent.id.name.clone())
+        map.entry(edge.from.id.name.clone())
             .or_default()
-            .push(child.clone());
+            .push(edge.to.clone());
     }
 
     for children in map.values_mut() {
         children.sort_by(|a, b| a.id.name.cmp(&b.id.name));
     }
-
     map
 }
 
@@ -369,17 +342,14 @@ fn render_children(
             let cycle = stack.contains(&child.id.name);
             if cycle {
                 println!(
-                    "{}{} {} (cycle detected)",
-                    prefix,
-                    connector,
+                    "{prefix}{connector} {} (cycle detected)",
                     artifact_label(child)
                 );
                 continue;
             }
-            println!("{}{} {}", prefix, connector, artifact_label(child));
+            println!("{prefix}{connector} {}", artifact_label(child));
             let next_prefix = format!(
-                "{}{}",
-                prefix,
+                "{prefix}{}",
                 if index + 1 == children.len() {
                     "    "
                 } else {
@@ -396,25 +366,21 @@ fn artifact_label(summary: &ArtifactSummary) -> String {
     let kind = match summary.id.kind {
         ArtifactKind::Specification => "spec",
         ArtifactKind::Implementation => "impl",
-        ArtifactKind::ScratchPad => "scratch",
     };
-    match summary.version.as_ref() {
-        Some(version) => format!("{} {}@{}", kind, summary.id.name, version),
-        None => format!("{} {}", kind, summary.id.name),
+    format!("{} {}", kind, summary.id.name)
+}
+
+fn view_label(view: DependencyView) -> &'static str {
+    match view {
+        DependencyView::Downstream => "downstream",
+        DependencyView::Upstream => "upstream",
+        DependencyView::All => "complete",
     }
 }
 
-fn capitalize(input: &str) -> String {
-    let mut chars = input.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
-        None => String::new(),
-    }
-}
-
-fn describe_template_locator(locator: &TemplateLocator) -> String {
-    match locator {
-        TemplateLocator::FilePath(path) => path.display().to_string(),
-        TemplateLocator::Url(url) => url.clone(),
+fn scope_label(scope: DependencyScope) -> &'static str {
+    match scope {
+        DependencyScope::Specification => "specification",
+        DependencyScope::Implementation => "implementation",
     }
 }

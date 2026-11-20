@@ -22,9 +22,8 @@ pub fn run() -> ExitCode {
     }
 }
 
-/// Parses CLI arguments, resolves the workspace, and dispatches to the appropriate
-/// command while enforcing the CLI Invocation Model (spec/specman-cli/spec.md#concept-cli-invocation-model).
-/// Returns a POSIX `sysexits`-compatible `ExitCode` so automation can react deterministically.
+/// Parses CLI arguments, resolves the workspace, and dispatches to the appropriate command while
+/// enforcing the CLI Invocation Model (spec/specman-cli/spec.md#concept-cli-invocation-model).
 pub fn run_cli<I, S>(args: I) -> Result<ExitCode, CliError>
 where
     I: IntoIterator<Item = S>,
@@ -55,57 +54,71 @@ fn init_tracing() {
         .try_init();
 }
 
-/// Defines the root `clap::Command` tree, including global flags and subcommands for
-/// `status`, `spec`, `impl`, and `scratch`. Keeping the tree centralized ensures every
-/// command advertises its help text per the CLI Invocation Model requirements.
+/// Defines the root `clap::Command` tree with global flags and subcommands for every command in
+/// the Lifecycle Command Surface.
 fn build_cli() -> Command {
     Command::new(NAME)
         .about("SpecMan CLI")
         .arg(
             Arg::new("workspace")
                 .long("workspace")
+                .global(true)
                 .value_name("PATH")
-                .help("Specify the workspace root. Defaults to the nearest ancestor with a .specman folder."),
+                .help("Specify the workspace root. Defaults to the nearest ancestor git toplevel with a specman.json manifest."),
         )
         .arg(
             Arg::new("json")
                 .long("json")
+                .global(true)
                 .action(ArgAction::SetTrue)
                 .help("Emit newline-delimited JSON instead of human-readable text."),
         )
         .arg(
             Arg::new("verbose")
                 .long("verbose")
+                .global(true)
                 .action(ArgAction::SetTrue)
-                .help("Emit additional logging about template locators, workspace paths, and adapters."),
+                .help("Emit additional logging about workspace paths and adapters."),
         )
         .subcommand_required(true)
         .subcommand(commands::init::command())
         .subcommand(commands::status::command())
         .subcommand(commands::spec::command())
         .subcommand(commands::implementation::command())
-        .subcommand(commands::scratch::command())
-        .subcommand(commands::templates::command())
+        .subcommand(commands::install::command())
+        .subcommand(commands::metadata::command())
+        .subcommand(commands::compliance::command())
+        .subcommand(commands::structure::command())
 }
 
-/// Delegates parsed subcommands to their respective modules, ensuring the Lifecycle
-/// Command Surface stays thin and predictable. Unknown subcommands map to `EX_USAGE` so
-/// callers receive actionable feedback.
+/// Delegates parsed subcommands to their modules. `init`, `spec new`, and `impl new` run without
+/// a resolved workspace (they are the commands that create it); every other command requires
+/// workspace discovery and fails fast when none is found.
 fn dispatch(
     matches: &ArgMatches,
     workspace_override: Option<String>,
     verbosity: Verbosity,
 ) -> Result<commands::CommandResult, CliError> {
     match matches.subcommand() {
-        Some(("init", sub)) => commands::init::run(workspace_override, sub),
+        Some(("init", sub)) => {
+            return commands::init::run(workspace_override, sub);
+        }
+        Some(("spec", sub)) if sub.subcommand_name() == Some("new") => {
+            let root = crate::context::resolve_creation_root(workspace_override)?;
+            let (_, new_matches) = sub.subcommand().unwrap();
+            return commands::spec::run_new(&root, new_matches);
+        }
+        Some(("impl", sub)) if sub.subcommand_name() == Some("new") => {
+            let root = crate::context::resolve_creation_root(workspace_override)?;
+            let (_, new_matches) = sub.subcommand().unwrap();
+            return commands::implementation::run_new(&root, new_matches);
+        }
         _ => {
             let session = CliSession::bootstrap(workspace_override, verbosity)?;
             if session.verbosity.verbose {
                 tracing::info!(
                     workspace = %session.workspace_paths.root().display(),
-                    spec_dir = %session.workspace_paths.spec_dir().display(),
-                    impl_dir = %session.workspace_paths.impl_dir().display(),
-                    scratch_dir = %session.workspace_paths.scratchpad_dir().display(),
+                    dot_specman = %session.workspace_paths.dot_specman().display(),
                     "resolved workspace context"
                 );
             }
@@ -122,8 +135,10 @@ fn dispatch_with_session(
         Some(("status", sub)) => commands::status::run(session, sub),
         Some(("spec", sub)) => commands::spec::run(session, sub),
         Some(("impl", sub)) => commands::implementation::run(session, sub),
-        Some(("scratch", sub)) => commands::scratch::run(session, sub),
-        Some(("template", sub)) => commands::templates::run(session, sub),
+        Some(("install", sub)) => commands::install::run(session, sub),
+        Some(("metadata", sub)) => commands::metadata::run(session, sub),
+        Some(("compliance", sub)) => commands::compliance::run(session, sub),
+        Some(("structure", sub)) => commands::structure::run(session, sub),
         _ => Err(CliError::new("missing command", ExitStatus::Usage)),
     }
 }

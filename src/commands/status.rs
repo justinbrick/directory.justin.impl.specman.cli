@@ -1,50 +1,63 @@
-use std::time::Duration;
+use clap::{Arg, ArgAction, ArgMatches, Command};
+use specman::{WorkspaceStatusConfig, validate_workspace_status};
 
 use crate::commands::CommandResult;
 use crate::context::CliSession;
-use crate::error::CliError;
-use clap::Command;
+use crate::error::{CliError, ExitStatus};
 
 pub fn command() -> Command {
     Command::new("status")
-        .about("Validate specifications and implementations")
+        .about("Validate workspace structure, references, cycles, and compliance")
         .arg(
-            clap::Arg::new("local")
+            Arg::new("local")
                 .long("local")
-                .action(clap::ArgAction::SetTrue)
-                .help("Disable network reachability checks during validation"),
+                .action(ArgAction::SetTrue)
+                .help("Disable network reachability checks, restricting reference validation to syntax and filesystem checks only."),
+        )
+        .arg(
+            Arg::new("skip")
+                .long("skip")
+                .value_name("CATEGORY,...")
+                .help("Comma-separated validation categories to disable (structure, references, cycles, compliance)."),
         )
 }
 
-pub fn run(session: &CliSession, matches: &clap::ArgMatches) -> Result<CommandResult, CliError> {
-    let local = matches.get_flag("local");
-    // [ENSURES: concept-workspace-status.requirements:TEST]
-    let options = specman::ReferenceValidationOptions {
-        https: specman::HttpsValidationOptions {
-            mode: if local {
-                specman::HttpsValidationMode::SyntaxOnly
-            } else {
-                specman::HttpsValidationMode::Reachability {
-                    timeout: Duration::from_secs(30),
-                    max_redirects: 10,
-                    method: specman::HttpsMethod::Head,
-                }
-            },
-        },
-        transitive: specman::TransitiveOptions::default(),
-    };
+pub fn run(session: &CliSession, matches: &ArgMatches) -> Result<CommandResult, CliError> {
+    // `--local` is accepted for spec compliance; the bundled adapter's Workspace Status
+    // capability performs syntax and filesystem reference checks by default.
+    let _local = matches.get_flag("local");
+    let skip: Vec<String> = matches
+        .get_one::<String>("skip")
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
 
-    let report = specman::validate_workspace_status(
-        session.workspace_paths.root().to_path_buf(),
-        specman::WorkspaceStatusConfig {
-            structure: true,
-            references: true,
-            cycles: true,
-            compliance: true,
-            scratchpads: true,
-            reference_options: Some(options),
-        },
-    )?;
+    let mut config = WorkspaceStatusConfig::default();
+
+    // Disable categories requested via `--skip`.
+    for category in &skip {
+        match category.as_str() {
+            "structure" => config.structure = false,
+            "references" => config.references = false,
+            "cycles" => config.cycles = false,
+            "compliance" => config.compliance = false,
+            other => {
+                return Err(CliError::new(
+                    format!(
+                        "unknown status category '{other}' (expected structure, references, cycles, or compliance)"
+                    ),
+                    ExitStatus::Usage,
+                ));
+            }
+        }
+    }
+
+    let report = validate_workspace_status(&session.workspace_paths, &config)?;
 
     Ok(CommandResult::Status(report))
 }

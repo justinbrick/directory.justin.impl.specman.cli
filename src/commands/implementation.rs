@@ -1,170 +1,206 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use serde::Serialize;
+use serde_json::json;
 use specman::{
-    ArtifactId, ArtifactKind, ArtifactSummary, DependencyTree,
-    ImplementationFrontMatter, SpecificationFrontMatter, ArtifactIdentityFields, ReferenceEntry,
-    CreateImplOptions, CreateResult, DeleteOptions, DeleteResult,
-    create_implementation, delete_artifact, split_front_matter,
+    ArtifactId, ArtifactKind, DeleteOptions, DeleteResult, GitReference, ImplementsEntry,
+    SpecManProjectManifest, delete_artifact, load_manifest, parse_manifest,
 };
 
-use crate::commands::CommandResult;
-use crate::commands::dependencies::{self, DependencyScope};
+use crate::commands::dependencies;
+use crate::commands::{CommandResult, DependencyScope};
 use crate::context::CliSession;
 use crate::error::{CliError, ExitStatus};
 use crate::util;
 
-pub type DeletionTree = DependencyTree;
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ImplSummary {
-    pub name: String,
-    pub spec_locator: Option<String>,
-    pub spec_identifier: Option<String>,
-    pub version: Option<String>,
-    pub path: String,
-}
-
 pub fn command() -> Command {
     Command::new("impl")
-        .about("Manage implementation artifacts")
-        .subcommand(ls_command())
-        .subcommand(new_command())
-        .subcommand(delete_command())
-        .subcommand(dependencies_command())
+        .about("Manage the implementation project at the active workspace root")
+        .subcommand(impl_new_command())
+        .subcommand(dependencies::dependency_command(
+            "dependencies",
+            "implementation",
+        ))
+        .subcommand(impl_delete_command())
 }
 
 pub fn run(session: &CliSession, matches: &ArgMatches) -> Result<CommandResult, CliError> {
     match matches.subcommand() {
-        Some(("ls", _)) => list_impls(session),
-        Some(("new", sub)) => create_impl(session, sub),
-        Some(("delete", sub)) => delete_impl(session, sub),
+        Some(("new", sub)) => create_impl(session.workspace_paths.root(), sub),
         Some(("dependencies", sub)) => impl_dependencies(session, sub),
+        Some(("delete", sub)) => delete_impl(session, sub),
         _ => Err(CliError::new("unsupported impl command", ExitStatus::Usage)),
     }
 }
 
-fn list_impls(session: &CliSession) -> Result<CommandResult, CliError> {
-    let mut implementations = Vec::new();
-    let impl_dir = session.workspace_paths.impl_dir();
-    if impl_dir.is_dir() {
-        for entry in fs::read_dir(impl_dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                let path = entry.path().join("impl.md");
-                if path.is_file() {
-                    implementations.push(read_impl_summary(session.workspace_paths.root(), &path)?);
-                }
-            }
-        }
-        implementations.sort_by(|a, b| a.name.cmp(&b.name));
-    }
-    Ok(CommandResult::ImplList { implementations })
+/// Entry point for `impl new` when no session has been bootstrapped (the project manifest does
+/// not yet exist). Resolves the creation root and dispatches to the shared create routine.
+pub fn run_new(root: &std::path::Path, matches: &ArgMatches) -> Result<CommandResult, CliError> {
+    crate::context::ensure_git_repository(root)?;
+    create_impl(root, matches)
 }
 
-fn create_impl(session: &CliSession, matches: &ArgMatches) -> Result<CommandResult, CliError> {
-    let positional = matches.get_one::<String>("name");
-    let flag = matches.get_one::<String>("name-flag");
-    if positional.is_some() && flag.is_some() {
+fn impl_new_command() -> Command {
+    Command::new("new")
+        .about("Create a new implementation project at the workspace root")
+        .arg(Arg::new("name").value_name("NAME").help("Implementation name (positional)."))
+        .arg(
+            Arg::new("name-flag")
+                .long("name")
+                .value_name("VALUE")
+                .help("Explicit implementation name. Must not be combined with a positional name."),
+        )
+        .arg(Arg::new("description").long("description").value_name("VALUE"))
+        .arg(Arg::new("tags").long("tags").value_name("A,B,C"))
+        .arg(
+            Arg::new("implements")
+                .long("implements")
+                .value_name("ALIAS=URL@REF")
+                .action(ArgAction::Append)
+                .help("A specification to implement (alias=url@ref). May be repeated; at least one is required."),
+        )
+        .arg(
+            Arg::new("constraints")
+                .long("constraints")
+                .value_name("REGEX,...")
+                .action(ArgAction::Append)
+                .help("Comma-separated constraint regexes attached to the preceding --implements entry."),
+        )
+        .arg(
+            Arg::new("language")
+                .long("language")
+                .value_name("LANG[@VERSION]")
+                .help("The implementing language (e.g. rust, rust@1.80)."),
+        )
+}
+
+fn create_impl(root: &Path, matches: &ArgMatches) -> Result<CommandResult, CliError> {
+    ensure_uninitialized_at(root)?;
+
+    let positional = matches.get_one::<String>("name").cloned();
+    let named = matches.get_one::<String>("name-flag").cloned();
+
+    // `impl new` MUST require exactly one name: positional XOR --name, error on both or neither.
+    let name = match (positional, named) {
+        (Some(_), Some(_)) => {
+            return Err(CliError::new(
+                "provide the implementation name either positionally or via --name, not both",
+                ExitStatus::Usage,
+            ));
+        }
+        (Some(name), None) | (None, Some(name)) => name,
+        (None, None) => {
+            return Err(CliError::new(
+                "implementation name is required (positional or --name)",
+                ExitStatus::Usage,
+            ));
+        }
+    };
+
+    let description = matches.get_one::<String>("description").cloned();
+    let tags = util::split_csv(matches.get_one::<String>("tags"));
+    let language = matches.get_one::<String>("language").cloned();
+
+    // Gather parallel `--implements` and `--constraints` values. Constraints associate
+    // positionally with the implements entries (constraints[0] applies to implements[0], etc.).
+    let implements_raw: Vec<String> = matches
+        .get_many::<String>("implements")
+        .map(|vals| vals.cloned().collect())
+        .unwrap_or_default();
+    let constraints_raw: Vec<String> = matches
+        .get_many::<String>("constraints")
+        .map(|vals| vals.cloned().collect())
+        .unwrap_or_default();
+
+    if implements_raw.is_empty() {
         return Err(CliError::new(
-            "specify the implementation name either positionally or with --name, not both",
+            "at least one --implements entry is required",
             ExitStatus::Usage,
         ));
     }
-    let name = flag
-        .cloned()
-        .or_else(|| positional.cloned())
-        .ok_or_else(|| CliError::new("implementation name required", ExitStatus::Usage))?;
-    util::validate_slug(&name, "implementation")?;
 
-    let spec_locator = matches
-        .get_one::<String>("spec")
-        .ok_or_else(|| CliError::new("--spec is required", ExitStatus::Usage))?;
-    let resolved_spec = resolve_spec_locator(session, spec_locator)?;
-
-    let location = matches
-        .get_one::<String>("location")
-        .cloned()
-        .unwrap_or_else(|| format!("src/{name}"));
-
-    let folder = session.workspace_paths.impl_dir().join(&name);
-    if folder.exists() {
-        return Err(CliError::new(
-            format!("implementation {name} already exists"),
-            ExitStatus::Usage,
-        ));
+    // Validate every `--implements` entry before any filesystem mutation.
+    let mut implements = Vec::with_capacity(implements_raw.len());
+    for (i, token) in implements_raw.iter().enumerate() {
+        let reference: GitReference = util::parse_reference(token, "--implements")?;
+        let constraint_regexes = constraints_raw
+            .get(i)
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        implements.push(ImplementsEntry {
+            ref_: reference,
+            constraints: constraint_regexes,
+        });
     }
 
-    let mut references = Vec::new();
-    // Add implicit reference to spec (legacy behavior preserved)
-    references.push(ReferenceEntry {
-        reference: resolved_spec.clone(),
-        reference_type: Some("specification".to_string()),
-        optional: Some(false),
+    // Build the manifest as JSON and validate it against the bundled data model before writing.
+    let implements_value = serde_json::to_value(&implements).map_err(|e| {
+        CliError::new(
+            format!("failed to encode implements: {e}"),
+            ExitStatus::Software,
+        )
+    })?;
+
+    let mut manifest = json!({
+        "name": name,
+        "impl": { "implements": implements_value },
     });
+    if let Some(description) = &description {
+        manifest["description"] = json!(description);
+    }
+    if !tags.is_empty() {
+        manifest["tags"] = json!(tags);
+    }
 
-    let front_matter = ImplementationFrontMatter {
-        identity: ArtifactIdentityFields::default(),
-        spec: Some(resolved_spec.clone()),
-        location: Some(location),
-        references,
-        ..Default::default()
-    };
+    persist_manifest_value(&root, manifest)?;
 
-    let result = create_implementation(
-        &session.env,
-        CreateImplOptions {
-            name: name.clone(),
-            target: resolved_spec.clone(),
-            dry_run: false,
-            front_matter: Some(front_matter),
-        },
-    )
-    .map_err(CliError::from)?;
-
-    let path = match result {
-        CreateResult::Persisted(p) => p.path,
-        CreateResult::DryRun(_) => unreachable!(),
-    };
-
-    let summary = read_impl_summary(session.workspace_paths.root(), &path)?;
+    // Render the implementation document at `impl.md` (the repository root).
+    let mut body = format!("# {name}\n\nImplementation of `{name}`.\n");
+    if let Some(language) = &language {
+        body.push_str(&format!("\n## Implementing Language\n\n{language}\n"));
+    }
+    fs::write(root.join("impl.md"), body)?;
 
     Ok(CommandResult::ImplCreated {
-        summary,
-        path: path.display().to_string(),
+        name,
+        path: root.join("impl.md").display().to_string(),
     })
 }
 
+fn impl_delete_command() -> Command {
+    Command::new("delete")
+        .about("Delete the implementation project after dependency checks")
+        .arg(
+            Arg::new("force")
+                .long("force")
+                .action(ArgAction::SetTrue)
+                .help("Override dependency blockers after printing the dependency tree."),
+        )
+}
+
 fn delete_impl(session: &CliSession, matches: &ArgMatches) -> Result<CommandResult, CliError> {
-    let name = matches
-        .get_one::<String>("name")
-        .cloned()
-        .ok_or_else(|| CliError::new("implementation name required", ExitStatus::Usage))?;
     let forced = matches.get_flag("force");
+    let manifest = load_manifest(&session.workspace_paths.root().join("specman.json"))
+        .map_err(CliError::from)?;
+    if !manifest.is_impl() {
+        return Err(CliError::new(
+            "active project is not an implementation",
+            ExitStatus::Usage,
+        ));
+    }
+    let name = manifest.name().to_string();
     let artifact = ArtifactId {
         kind: ArtifactKind::Implementation,
         name: name.clone(),
     };
-    let folder = session.workspace_paths.impl_dir().join(&name);
-    if !folder.exists() {
-        return Err(CliError::new(
-            format!("implementation {name} does not exist"),
-            ExitStatus::Usage,
-        ));
-    }
 
-    let impact = specman::check_deletion_impact(&session.env, &artifact)
-        .map_err(CliError::from)?;
-
-    if impact.blocked && !forced {
-        return Err(CliError::new(
-            format!("refusing to delete {name}; downstream artifacts detected (use --force)"),
-            ExitStatus::Data,
-        ));
-    }
-    
     let result = delete_artifact(
         &session.env,
         &artifact,
@@ -174,118 +210,29 @@ fn delete_impl(session: &CliSession, matches: &ArgMatches) -> Result<CommandResu
         },
     )
     .map_err(CliError::from)?;
-    
+
     let removed = match result {
         DeleteResult::Removed(r) => r,
-        DeleteResult::DryRun(_) => unreachable!(),
-    };
-    
-    let removed_path = util::workspace_relative(session.workspace_paths.root(), &removed.directory);
-
-    let spec_locator = impact.dependencies.root.metadata.get("spec").cloned();
-    let spec_identifier = spec_locator
-        .as_deref()
-        .and_then(|locator| spec_identifier_from_locator(session.workspace_paths.root(), locator));
-    let summary = ImplSummary {
-        name,
-        spec_locator,
-        spec_identifier,
-        version: version_from_summary(&impact.dependencies.root),
-        path: util::workspace_relative(session.workspace_paths.root(), &folder),
+        DeleteResult::DryRun(_) => unreachable!("dry-run not requested"),
     };
 
     Ok(CommandResult::ImplDeleted {
-        summary,
+        name,
         forced,
-        tree: impact.dependencies,
-        removed_path,
+        removed_path: removed.directory.display().to_string(),
     })
-}
-
-fn ls_command() -> Command {
-    Command::new("ls").about("List implementations in the workspace")
-}
-
-fn new_command() -> Command {
-    Command::new("new")
-        .about("Create a new implementation")
-        .arg(Arg::new("name").value_name("NAME"))
-        .arg(
-            Arg::new("name-flag").long("name").value_name("NAME").help(
-                "Explicit implementation name. If set, the positional argument must be omitted.",
-            ),
-        )
-        .arg(
-            Arg::new("spec")
-                .long("spec")
-                .required(true)
-                .value_name("SPEC")
-                .help("Target specification name, workspace-relative path, or HTTPS URL"),
-        )
-        .arg(
-            Arg::new("location")
-                .long("location")
-                .value_name("PATH")
-                .help("Relative path to the implementation code location"),
-        )
-}
-
-fn delete_command() -> Command {
-    Command::new("delete")
-        .about("Delete an implementation after dependency checks")
-        .arg(
-            Arg::new("name")
-                .required(true)
-                .value_name("NAME")
-                .help("Implementation name to delete"),
-        )
-        .arg(
-            Arg::new("force")
-                .long("force")
-                .action(ArgAction::SetTrue)
-                .help("Override dependency blockers after printing the dependency tree."),
-        )
-}
-
-fn dependencies_command() -> Command {
-    dependencies::with_direction_flags(
-        Command::new("dependencies")
-            .about("Render the dependency tree for an implementation")
-            .arg(
-                Arg::new("name")
-                    .required(true)
-                    .value_name("NAME")
-                    .help("Implementation slug (folder name)"),
-            ),
-    )
 }
 
 fn impl_dependencies(
     session: &CliSession,
     matches: &ArgMatches,
 ) -> Result<CommandResult, CliError> {
-    let name = matches
-        .get_one::<String>("name")
-        .cloned()
-        .ok_or_else(|| CliError::new("implementation name required", ExitStatus::Usage))?;
-    util::validate_slug(&name, "implementation")?;
-
-    let impl_file = session
-        .workspace_paths
-        .impl_dir()
-        .join(&name)
-        .join("impl.md");
-    if !impl_file.is_file() {
-        return Err(CliError::new(
-            format!("implementation {name} does not exist"),
-            ExitStatus::Usage,
-        ));
-    }
-
     let view = dependencies::parse_view(matches)?;
+    let manifest = load_manifest(&session.workspace_paths.root().join("specman.json"))
+        .map_err(CliError::from)?;
     let artifact = ArtifactId {
         kind: ArtifactKind::Implementation,
-        name,
+        name: manifest.name().to_string(),
     };
     let tree = session
         .env
@@ -300,89 +247,30 @@ fn impl_dependencies(
     })
 }
 
-fn read_impl_summary(root: &Path, path: &Path) -> Result<ImplSummary, CliError> {
-    let content = fs::read_to_string(path)?;
-    let split = split_front_matter(&content)
-        .map_err(|err| CliError::new(err.to_string(), ExitStatus::Config))?;
-    let fm: ImplementationFrontMatter = serde_yaml::from_str(split.yaml)
-        .map_err(|err| CliError::new(err.to_string(), ExitStatus::Config))?;
-    let spec_locator = fm.spec.clone();
-    let spec_identifier = spec_locator
-        .as_deref()
-        .and_then(|locator| spec_identifier_from_locator(root, locator));
-    Ok(ImplSummary {
-        name: fm
-            .identity
-            .name
-            .clone()
-            .unwrap_or_else(|| infer_name_from_path(path)),
-        spec_locator,
-        spec_identifier,
-        version: fm.identity.version.clone(),
-        path: util::workspace_relative(root, path),
-    })
-}
-
-fn infer_name_from_path(path: &Path) -> String {
-    path.parent()
-        .and_then(|dir| dir.file_name())
-        .and_then(|name| name.to_str())
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-fn version_from_summary(summary: &ArtifactSummary) -> Option<String> {
-    summary.version.as_ref().map(ToString::to_string)
-}
-
-fn resolve_spec_locator(session: &CliSession, input: &str) -> Result<String, CliError> {
-    if input.starts_with("https://") {
-        return Ok(input.to_string());
-    }
-    if input.contains("://") {
+/// Ensures the project has NOT yet declared a `spec` or `impl` object.
+fn ensure_uninitialized_at(root: &Path) -> Result<(), CliError> {
+    let manifest_path = root.join("specman.json");
+    if manifest_path.is_file() {
         return Err(CliError::new(
-            format!("unsupported spec locator scheme: {input}"),
+            "workspace already declares a project; refusing to overwrite",
             ExitStatus::Usage,
         ));
     }
-
-    let workspace_root = session.workspace_paths.root();
-    let direct = workspace_root.join(input);
-    if direct.is_file() {
-        return Ok(util::workspace_relative(workspace_root, &direct));
-    }
-
-    let shorthand = workspace_root.join("spec").join(input).join("spec.md");
-    if shorthand.is_file() {
-        return Ok(util::workspace_relative(workspace_root, &shorthand));
-    }
-
-    Err(CliError::new(
-        format!("unable to resolve specification locator '{input}'"),
-        ExitStatus::Usage,
-    ))
+    Ok(())
 }
 
-fn spec_identifier_from_locator(root: &Path, locator: &str) -> Option<String> {
-    if locator.starts_with("https://") {
-        return Some(locator.to_string());
-    }
-    let relative = Path::new(locator);
-    let resolved: PathBuf = if relative.is_absolute() {
-        relative.into()
-    } else {
-        root.join(relative)
-    };
-    if !resolved.is_file() {
-        return Some(locator.to_string());
-    }
-    let content = fs::read_to_string(&resolved).ok()?;
-    let split = split_front_matter(&content).ok()?;
-    let fm: SpecificationFrontMatter = serde_yaml::from_str(split.yaml).ok()?;
-    match (fm.identity.name, fm.identity.version) {
-        (Some(name), Some(version)) => Some(format!("{name}@{version}")),
-        (Some(name), None) => Some(name),
-        (None, Some(version)) => Some(format!("(unknown)@{version}")),
-        _ => Some(locator.to_string()),
-    }
+/// Validates and writes a manifest JSON value to `specman.json` at the workspace root.
+pub(crate) fn persist_manifest_value(
+    root: &Path,
+    value: serde_json::Value,
+) -> Result<(), CliError> {
+    let _: SpecManProjectManifest = parse_manifest(&value.to_string()).map_err(CliError::from)?;
+    let serialized = serde_json::to_string_pretty(&value).map_err(|e| {
+        CliError::new(
+            format!("failed to serialize manifest: {e}"),
+            ExitStatus::Software,
+        )
+    })?;
+    fs::write(root.join("specman.json"), serialized)?;
+    Ok(())
 }

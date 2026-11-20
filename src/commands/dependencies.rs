@@ -1,26 +1,15 @@
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use serde::Serialize;
 
+use crate::commands::DependencyView;
 use crate::error::{CliError, ExitStatus};
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum DependencyView {
-    Downstream,
-    Upstream,
-    All,
-}
-
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DependencyScope {
-    Specification,
-    Implementation,
-    ScratchPad,
-}
-
-pub fn with_direction_flags(command: Command) -> Command {
-    command
+/// Appends the mutually exclusive `--downstream`, `--upstream`, and `--all` direction flags to a
+/// subcommand. Combining more than one raises `EX_USAGE`; omitting all behaves as `--downstream`.
+pub fn dependency_command(name: &'static str, about_kind: &'static str) -> Command {
+    Command::new(name)
+        .about(format!(
+            "Render the dependency tree for the {about_kind} project"
+        ))
         .arg(
             Arg::new("downstream")
                 .long("downstream")
@@ -37,45 +26,29 @@ pub fn with_direction_flags(command: Command) -> Command {
             Arg::new("all")
                 .long("all")
                 .action(ArgAction::SetTrue)
-                .help("Render both upstream and downstream trees."),
+                .help("Render both upstream and downstream dependency trees."),
         )
 }
 
+/// Parses the direction flags, enforcing mutual exclusivity.
 pub fn parse_view(matches: &ArgMatches) -> Result<DependencyView, CliError> {
-    let selected = [
-        (DependencyView::Downstream, matches.get_flag("downstream")),
-        (DependencyView::Upstream, matches.get_flag("upstream")),
-        (DependencyView::All, matches.get_flag("all")),
-    ];
+    let downstream = matches.get_flag("downstream");
+    let upstream = matches.get_flag("upstream");
+    let all = matches.get_flag("all");
 
-    let mut chosen = None;
-    for (view, flag) in selected {
-        if flag {
-            if chosen.is_some() {
-                return Err(CliError::new(
-                    "use only one of --downstream, --upstream, or --all",
-                    ExitStatus::Usage,
-                ));
-            }
-            chosen = Some(view);
-        }
+    let selected = [downstream, upstream, all].iter().filter(|&&b| b).count();
+    if selected > 1 {
+        return Err(CliError::new(
+            "use only one of --downstream, --upstream, or --all",
+            ExitStatus::Usage,
+        ));
     }
 
-    Ok(chosen.unwrap_or(DependencyView::Downstream))
-}
-
-pub fn scope_label(scope: DependencyScope) -> &'static str {
-    match scope {
-        DependencyScope::Specification => "specification",
-        DependencyScope::Implementation => "implementation",
-        DependencyScope::ScratchPad => "scratch pad",
-    }
-}
-
-pub fn view_label(view: DependencyView) -> &'static str {
-    match view {
-        DependencyView::Downstream => "downstream",
-        DependencyView::Upstream => "upstream",
-        DependencyView::All => "complete",
-    }
+    Ok(if all {
+        DependencyView::All
+    } else if upstream {
+        DependencyView::Upstream
+    } else {
+        DependencyView::Downstream
+    })
 }

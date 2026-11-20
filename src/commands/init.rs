@@ -9,7 +9,7 @@ use crate::error::{CliError, ExitStatus};
 
 pub fn command() -> Command {
     Command::new("init")
-        .about("Initialize a SpecMan workspace")
+        .about("Initialize a SpecMan workspace scaffold within a git repository")
         .arg(
             Arg::new("path")
                 .value_name("PATH")
@@ -19,7 +19,7 @@ pub fn command() -> Command {
             Arg::new("dry-run")
                 .long("dry-run")
                 .action(ArgAction::SetTrue)
-                .help("Show the resolved workspace root without writing to disk."),
+                .help("Resolve and print the workspace root and paths that would be created or reused without writing to disk."),
         )
 }
 
@@ -28,39 +28,60 @@ pub fn run(
     matches: &ArgMatches,
 ) -> Result<CommandResult, CliError> {
     let positional = matches.get_one::<String>("path").cloned();
-    let target = workspace_override
-        .or(positional)
-        .unwrap_or_else(|| ".".to_string());
+    // `--workspace` takes precedence over the positional value when both are supplied.
+    let target = match workspace_override.or(positional) {
+        Some(raw) => absolutize(&raw)?,
+        // When neither is supplied, the current working directory is the target path.
+        None => env::current_dir()?,
+    };
     let dry_run = matches.get_flag("dry-run");
 
-    let root = absolutize(&target)?;
-    let plan = plan_workspace(&root)?;
+    let root = target;
 
     if dry_run {
+        let already = root.join("specman.json").is_file();
+        let ctx = plan(&root, already)?;
         return Ok(CommandResult::WorkspaceInitialized {
-            root: plan.root.display().to_string(),
-            dot_specman: plan.dot_specman.display().to_string(),
-            created: !plan.already_initialized,
+            root: ctx.root,
+            dot_specman: ctx.dot_specman,
+            created: !already,
             dry_run: true,
         });
     }
 
-    let created = apply_init(&plan)?;
+    let already = root.join("specman.json").is_file();
+    if already {
+        // Idempotent: reuse an existing workspace without mutating files.
+        let dot_specman = root.join(".specman");
+        let created = ensure_scaffold(&root, &dot_specman)?;
+        return Ok(CommandResult::WorkspaceInitialized {
+            root: root.display().to_string(),
+            dot_specman: dot_specman.display().to_string(),
+            created,
+            dry_run: false,
+        });
+    }
+
+    // Delegate workspace creation to the SpecMan Core initializer.
+    let context = WorkspaceDiscovery::create(root.clone()).map_err(map_workspace_error)?;
+    let paths = context.into_paths();
+
     Ok(CommandResult::WorkspaceInitialized {
-        root: plan.root.display().to_string(),
-        dot_specman: plan.dot_specman.display().to_string(),
-        created,
+        root: paths.root().display().to_string(),
+        dot_specman: paths.dot_specman().display().to_string(),
+        created: true,
         dry_run: false,
     })
 }
 
-struct InitPlan {
-    root: PathBuf,
-    dot_specman: PathBuf,
-    already_initialized: bool,
+/// Dry-run result describing the resolved root and `.specman` directory.
+struct InitContext {
+    root: String,
+    dot_specman: String,
 }
 
-fn plan_workspace(root: &Path) -> Result<InitPlan, CliError> {
+fn plan(root: &Path, _already: bool) -> Result<InitContext, CliError> {
+    // Validate the target without writing anything.
     if root.exists() && !root.is_dir() {
         return Err(CliError::new(
             format!("workspace root {} is not a directory", root.display()),
@@ -68,55 +89,72 @@ fn plan_workspace(root: &Path) -> Result<InitPlan, CliError> {
         ));
     }
 
-    let dot_specman = root.join(".specman");
-    let already_initialized = dot_specman.is_dir();
+    // Refuse nested workspace creation by checking ancestors.
     for ancestor in root.ancestors().skip(1) {
-        let existing = ancestor.join(".specman");
-        if existing.is_dir() {
+        if ancestor.join("specman.json").is_file() {
             return Err(CliError::new(
                 format!(
                     "cannot initialize workspace at {}; ancestor workspace already exists at {}",
                     root.display(),
-                    existing.display()
+                    ancestor.join("specman.json").display()
                 ),
                 ExitStatus::Usage,
             ));
         }
     }
 
-    Ok(InitPlan {
-        root: root.to_path_buf(),
-        dot_specman,
-        already_initialized,
+    // Verify a git repository exists at the target root.
+    if !root.join(".git").is_dir() {
+        return Err(CliError::new(
+            format!(
+                "workspace root {} is missing a .git directory; run `git init` there first",
+                root.display()
+            ),
+            ExitStatus::Usage,
+        ));
+    }
+
+    Ok(InitContext {
+        root: root.display().to_string(),
+        dot_specman: root.join(".specman").display().to_string(),
     })
 }
 
-fn apply_init(plan: &InitPlan) -> Result<bool, CliError> {
-    if plan.already_initialized {
-        return Ok(false);
+/// Ensures `.specman` and required subdirectories exist when a manifest is already present.
+fn ensure_scaffold(root: &Path, dot_specman: &Path) -> Result<bool, CliError> {
+    let missing = !dot_specman.is_dir();
+    if missing {
+        std::fs::create_dir_all(dot_specman.join("cache"))?;
+        std::fs::create_dir_all(root.join("spec"))?;
     }
-
-    WorkspaceDiscovery::create(&plan.root).map_err(map_workspace_error)?;
-    Ok(true)
+    Ok(missing)
 }
 
 fn absolutize(raw: &str) -> Result<PathBuf, CliError> {
     let candidate = PathBuf::from(raw);
-    let base = if candidate.is_absolute() {
-        candidate
-    } else {
-        env::current_dir()
-            .map_err(|err| CliError::new(err.to_string(), ExitStatus::Io))?
-            .join(candidate)
-    };
+    if !candidate.is_absolute() {
+        return Err(CliError::new(
+            format!("workspace root '{raw}' must be an absolute path"),
+            ExitStatus::Usage,
+        ));
+    }
 
-    Ok(lexical_normalize(&base))
+    // Reject path traversal (`..`) that could escape the intended root.
+    if candidate
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(CliError::new(
+            format!("workspace root '{raw}' must not traverse parent directories (..)"),
+            ExitStatus::Usage,
+        ));
+    }
+
+    Ok(lexical_normalize(&candidate))
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
-    let mut pending_parents: usize = 0;
-
     for component in path.components() {
         match component {
             Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
@@ -129,36 +167,23 @@ fn lexical_normalize(path: &Path) -> PathBuf {
                     .is_some_and(|c| matches!(c, Component::Normal(_)))
                 {
                     normalized.pop();
-                } else if normalized.is_absolute() {
-                    // Ignore attempts to go above the root for absolute paths.
-                } else {
-                    pending_parents += 1;
                 }
             }
-            Component::Normal(part) => {
-                while pending_parents > 0 {
-                    normalized.push("..");
-                    pending_parents -= 1;
-                }
-                normalized.push(part);
-            }
+            Component::Normal(part) => normalized.push(part),
         }
     }
-
-    while pending_parents > 0 {
-        normalized.push("..");
-        pending_parents -= 1;
-    }
-
     if normalized.as_os_str().is_empty() {
-        PathBuf::from(".")
+        PathBuf::from("/")
     } else {
         normalized
     }
 }
 
 fn map_workspace_error(err: WorkspaceError) -> CliError {
-    let status = match err {
+    let status = match &err {
+        WorkspaceError::GitMissing { .. } => ExitStatus::Usage,
+        WorkspaceError::NestedWorkspace { .. } => ExitStatus::Usage,
+        WorkspaceError::RelativePath { .. } => ExitStatus::Usage,
         WorkspaceError::Io(_) => ExitStatus::Io,
         _ => ExitStatus::Usage,
     };
