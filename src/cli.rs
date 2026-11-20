@@ -100,18 +100,16 @@ fn dispatch(
     verbosity: Verbosity,
 ) -> Result<commands::CommandResult, CliError> {
     match matches.subcommand() {
-        Some(("init", sub)) => {
-            return commands::init::run(workspace_override, sub);
-        }
+        Some(("init", sub)) => commands::init::run(workspace_override, sub),
         Some(("spec", sub)) if sub.subcommand_name() == Some("new") => {
             let root = crate::context::resolve_creation_root(workspace_override)?;
             let (_, new_matches) = sub.subcommand().unwrap();
-            return commands::spec::run_new(&root, new_matches);
+            commands::spec::run_new(&root, new_matches)
         }
         Some(("impl", sub)) if sub.subcommand_name() == Some("new") => {
             let root = crate::context::resolve_creation_root(workspace_override)?;
             let (_, new_matches) = sub.subcommand().unwrap();
-            return commands::implementation::run_new(&root, new_matches);
+            commands::implementation::run_new(&root, new_matches)
         }
         _ => {
             let session = CliSession::bootstrap(workspace_override, verbosity)?;

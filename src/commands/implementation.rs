@@ -159,7 +159,7 @@ fn create_impl(root: &Path, matches: &ArgMatches) -> Result<CommandResult, CliEr
         manifest["tags"] = json!(tags);
     }
 
-    persist_manifest_value(&root, manifest)?;
+    persist_manifest_value(root, manifest)?;
 
     // Render the implementation document at `impl.md` (the repository root).
     let mut body = format!("# {name}\n\nImplementation of `{name}`.\n");

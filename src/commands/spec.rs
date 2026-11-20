@@ -131,7 +131,7 @@ fn create_spec(root: &Path, matches: &ArgMatches) -> Result<CommandResult, CliEr
         manifest["tags"] = json!(tags);
     }
 
-    persist_manifest_value(&root, manifest)?;
+    persist_manifest_value(root, manifest)?;
 
     // Persist the rendered document only when `spec.index` is present. When absent, the CLI MUST
     // NOT assume a default filename (spec/specman-core/spec.md#entity-specproject).
